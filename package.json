@@ -1,0 +1,22 @@
+{
+  "name": "mtm-whatsapp-faq-bot",
+  "version": "1.0.0",
+  "description": "FAQ WhatsApp bot for Mysore Travel Mart (MTM)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "faq",
+    "bot",
+    "mtm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2"
+  }
+}
