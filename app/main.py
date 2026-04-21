@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 from typing import Any, Dict
 
@@ -126,8 +127,20 @@ async def send_whatsapp_text(to: str, text: str) -> None:
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(endpoint, headers=headers, json=payload)
-        response.raise_for_status()
+        try:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            print(f"Message sent to {to}. Meta response status={response.status_code}")
+        except httpx.HTTPStatusError as exc:
+            body_preview = exc.response.text[:500]
+            print(
+                "Meta API HTTP error while sending message. "
+                f"status={exc.response.status_code}, body={body_preview}"
+            )
+            raise
+        except Exception as exc:
+            print(f"Unexpected error while sending WhatsApp message: {exc}")
+            raise
 
 
 @app.get("/")
@@ -155,6 +168,7 @@ async def receive_whatsapp_webhook(request: Request):
         return PlainTextResponse(content="Missing WHATSAPP_APP_SECRET", status_code=500)
 
     if not is_valid_meta_signature(raw_body, signature_header):
+        print("Invalid Meta signature for incoming webhook request.")
         return PlainTextResponse(content="Invalid signature", status_code=403)
 
     payload = await request.json()
@@ -163,16 +177,28 @@ async def receive_whatsapp_webhook(request: Request):
         entry = payload.get("entry", [{}])[0]
         change = entry.get("changes", [{}])[0]
         value = change.get("value", {})
-        message = value.get("messages", [{}])[0]
+        messages = value.get("messages", [])
+        statuses = value.get("statuses", [])
 
+        if not messages:
+            if statuses:
+                print("Received status update event (no inbound message).")
+            else:
+                print("Webhook event without messages/statuses.")
+            return JSONResponse(content={"ok": True}, status_code=200)
+
+        message = messages[0]
         if message.get("type") != "text":
+            print(f"Ignoring non-text message type={message.get('type')}")
             return JSONResponse(content={"ok": True}, status_code=200)
 
         from_number = message.get("from", "")
         incoming_text = message.get("text", {}).get("body", "")
+        print(f"Incoming message from {from_number}: {incoming_text!r}")
         reply_text = build_reply_text(incoming_text)
         await send_whatsapp_text(from_number, reply_text)
     except Exception as exc:
-        print(f"Webhook processing failed: {exc}")
+        payload_preview = json.dumps(payload, ensure_ascii=True)[:1200]
+        print(f"Webhook processing failed: {exc}. payload={payload_preview}")
 
     return JSONResponse(content={"ok": True}, status_code=200)
