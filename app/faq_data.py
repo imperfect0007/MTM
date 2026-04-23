@@ -72,7 +72,9 @@ FAQ_ENTRIES: List[Dict[str, object]] = [
             "- 1 table\n"
             "- Welcome kit\n"
             "- 2 members per stall allowed\n"
-            "- ID cards"
+            "- ID cards\n"
+            "- 3 days of networking lunch for 2 people per stall\n"
+            "- 1 cocktail dinner for 2 people per stall"
         ),
     },
     {
