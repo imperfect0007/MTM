@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import asyncio
 from typing import Any, Dict
 
 import httpx
@@ -19,6 +20,36 @@ VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+
+# Keep-alive support:
+# - Render (and similar platforms) can put idle services to sleep.
+# - A running service can ping itself, but self-pings won't wake a sleeping service.
+# - Use an external monitor (UptimeRobot, cron-job.org, GitHub Actions) to hit /ping.
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
+KEEPALIVE_INTERVAL_SECONDS = int(os.getenv("KEEPALIVE_INTERVAL_SECONDS", "50"))
+ENABLE_SELF_PING = os.getenv("ENABLE_SELF_PING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def keepalive_loop() -> None:
+    url = KEEPALIVE_URL or ""
+    if not url:
+        return
+    interval = max(10, KEEPALIVE_INTERVAL_SECONDS)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                resp = await client.get(url)
+                print(f"Keepalive ping {url} -> {resp.status_code}")
+            except Exception as exc:
+                print(f"Keepalive ping failed for {url}: {exc}")
+            await asyncio.sleep(interval)
+
+
+@app.on_event("startup")
+async def _startup_keepalive() -> None:
+    if ENABLE_SELF_PING and (KEEPALIVE_URL or "").strip():
+        asyncio.create_task(keepalive_loop())
 
 
 def help_text() -> str:
@@ -146,6 +177,11 @@ async def send_whatsapp_text(to: str, text: str) -> None:
 @app.get("/")
 async def health() -> Dict[str, Any]:
     return {"ok": True, "service": "MTM WhatsApp FAQ Bot (FastAPI)"}
+
+
+@app.get("/ping")
+async def ping() -> Dict[str, Any]:
+    return {"ok": True}
 
 
 @app.get("/webhook/whatsapp")
