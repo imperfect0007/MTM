@@ -3,12 +3,15 @@ import hmac
 import json
 import os
 import asyncio
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse
 
 from app.faq_data import ID_TO_ANSWER, MENU_NUMBER_TO_ID, find_best_answer
 
@@ -20,6 +23,96 @@ VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+
+# Admin numbers that should receive stall enquiries (comma-separated).
+ADMIN_NUMBERS = [
+    n.strip().replace(" ", "")
+    for n in os.getenv("ADMIN_NUMBERS", "9449865970,9036739808").split(",")
+    if n.strip()
+]
+
+FLOOR_PLAN_FILENAME = "MTM_Floor_plan.pdf"
+FLOOR_PLAN_PATH = (Path(__file__).resolve().parents[1] / FLOOR_PLAN_FILENAME).resolve()
+
+# Public base URL used to build downloadable links (Render service URL).
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+# Very small in-memory conversation state (resets on deploy/restart).
+USER_NAME_BY_NUMBER: dict[str, str] = {}
+USER_STATE_BY_NUMBER: dict[str, str] = {}  # "awaiting_name" | "awaiting_enquiry"
+
+
+def get_public_base_url() -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if KEEPALIVE_URL:
+        parsed = urlparse(KEEPALIVE_URL)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def looks_like_floor_plan_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(k in lowered for k in ["floor plan", "floorplan", "layout", "stall layout", "plan pdf", "pdf plan"])
+
+
+def looks_like_stall_enquiry(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        k in lowered
+        for k in [
+            "stall",
+            "book stall",
+            "stall booking",
+            "need stall",
+            "enquire",
+            "enquiry",
+            "enquire stall",
+            "stall enquiry",
+        ]
+    )
+
+
+def start_stall_enquiry(from_number: str) -> Optional[str]:
+    if not from_number:
+        return None
+    if from_number in USER_NAME_BY_NUMBER and USER_NAME_BY_NUMBER[from_number].strip():
+        USER_STATE_BY_NUMBER[from_number] = "awaiting_enquiry"
+        return "Please share your stall requirement / enquiry details."
+    USER_STATE_BY_NUMBER[from_number] = "awaiting_name"
+    return "Sure. Please tell me your name."
+
+
+def handle_stall_enquiry_state(from_number: str, incoming_text: str) -> Optional[str]:
+    state = USER_STATE_BY_NUMBER.get(from_number)
+    text = (incoming_text or "").strip()
+    if not state:
+        return None
+
+    if state == "awaiting_name":
+        if not text:
+            return "Please tell me your name."
+        USER_NAME_BY_NUMBER[from_number] = text
+        USER_STATE_BY_NUMBER[from_number] = "awaiting_enquiry"
+        return f"Thanks, {text}. Please share your stall requirement / enquiry details."
+
+    if state == "awaiting_enquiry":
+        if not text:
+            return "Please share your stall requirement / enquiry details."
+        USER_STATE_BY_NUMBER.pop(from_number, None)
+        name = USER_NAME_BY_NUMBER.get(from_number, "").strip() or "N/A"
+        forward = "\n".join(
+            [
+                "New stall enquiry",
+                f"Name: {name}",
+                f"WhatsApp: {from_number}",
+                f"Message: {text}",
+            ]
+        )
+        return "__FORWARD_TO_ADMINS__" + forward
+
+    return None
 
 # Keep-alive support:
 # - Render (and similar platforms) can put idle services to sleep.
@@ -174,6 +267,28 @@ async def send_whatsapp_text(to: str, text: str) -> None:
             raise
 
 
+async def send_whatsapp_document(to: str, link: str, filename: str) -> None:
+    if not to or not link:
+        return
+    if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        print("Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID.")
+        return
+
+    endpoint = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "document",
+        "document": {"link": link, "filename": filename},
+    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(endpoint, headers=headers, json=payload)
+        response.raise_for_status()
+        print(f"Document sent to {to}. Meta response status={response.status_code}")
+
+
 @app.get("/")
 async def health() -> Dict[str, Any]:
     return {"ok": True, "service": "MTM WhatsApp FAQ Bot (FastAPI)"}
@@ -182,6 +297,11 @@ async def health() -> Dict[str, Any]:
 @app.get("/ping")
 async def ping() -> Dict[str, Any]:
     return {"ok": True}
+
+
+@app.get("/floor-plan")
+async def floor_plan() -> FileResponse:
+    return FileResponse(path=str(FLOOR_PLAN_PATH), filename=FLOOR_PLAN_FILENAME)
 
 
 @app.get("/webhook/whatsapp")
@@ -231,6 +351,43 @@ async def receive_whatsapp_webhook(request: Request):
         from_number = message.get("from", "")
         incoming_text = message.get("text", {}).get("body", "")
         print(f"Incoming message from {from_number}: {incoming_text!r}")
+
+        # 1) If user is mid-enquiry flow, continue it.
+        state_reply = handle_stall_enquiry_state(from_number, incoming_text)
+        if state_reply:
+            if state_reply.startswith("__FORWARD_TO_ADMINS__"):
+                forward_text = state_reply.replace("__FORWARD_TO_ADMINS__", "", 1)
+                for admin in ADMIN_NUMBERS:
+                    await send_whatsapp_text(admin, forward_text)
+                await send_whatsapp_text(from_number, "Thanks. Your enquiry has been shared with our team.")
+            else:
+                await send_whatsapp_text(from_number, state_reply)
+            return JSONResponse(content={"ok": True}, status_code=200)
+
+        # 2) If floor plan requested, send PDF link.
+        if looks_like_floor_plan_request(incoming_text):
+            base = get_public_base_url()
+            if base:
+                link = f"{base}/floor-plan"
+                await send_whatsapp_document(from_number, link=link, filename=FLOOR_PLAN_FILENAME)
+            else:
+                await send_whatsapp_text(from_number, "Floor plan is available. Please ask the organizer for the PDF.")
+
+            # If they are also enquiring about stalls, start enquiry flow.
+            if looks_like_stall_enquiry(incoming_text):
+                prompt = start_stall_enquiry(from_number)
+                if prompt:
+                    await send_whatsapp_text(from_number, prompt)
+            return JSONResponse(content={"ok": True}, status_code=200)
+
+        # 3) If stall enquiry detected, start enquiry flow (ask name first).
+        if looks_like_stall_enquiry(incoming_text):
+            prompt = start_stall_enquiry(from_number)
+            if prompt:
+                await send_whatsapp_text(from_number, prompt)
+            return JSONResponse(content={"ok": True}, status_code=200)
+
+        # 4) Default FAQ response.
         reply_text = build_reply_text(incoming_text)
         await send_whatsapp_text(from_number, reply_text)
     except Exception as exc:
